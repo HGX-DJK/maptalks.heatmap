@@ -21,6 +21,7 @@ const options = {
         1.0: 'red'
     },
     'radius': 25,
+    'radiusInMeters': null,
     'blur': 15,
     'heatValueScale': 1,
     'minOpacity': 0.05,
@@ -43,6 +44,14 @@ export class HeatLayer extends maptalks.Layer {
 
     getData() {
         return this._heats;
+    }
+
+    getHeatStats(options) {
+        const renderer = this._getRenderer();
+        if (!renderer || !renderer.getHeatStats) {
+            return [];
+        }
+        return renderer.getHeatStats(options);
     }
 
     setData(heats) {
@@ -191,7 +200,9 @@ HeatLayer.registerRenderer('canvas', class extends maptalks.renderer.CanvasRende
         if (!this._heater) {
             this._heater = simpleheat(this.canvas);
         }
-        this._heater.radius(layer.options['radius'] || this._heater.defaultRadius, layer.options['blur']);
+        const heatRadius = getHeatRadius(map, layer),
+            heatBlur = getHeatBlur(map, layer, heatRadius);
+        this._heater.radius(heatRadius || this._heater.defaultRadius, heatBlur);
         if (layer.options['gradient']) {
             this._heater.gradient(layer.options['gradient']);
         }
@@ -214,9 +225,13 @@ HeatLayer.registerRenderer('canvas', class extends maptalks.renderer.CanvasRende
                 return;
             }
         }
-        const data = this._heatData(heats, displayExtent);
+        this._heatRadius = this._heater._r;
+        const result = buildHeatData(map, layer, heats, displayExtent, this._heater._r);
+        const data = result.data;
+        this._heatStats = result.stats;
         this._heater.data(data).draw(layer.options['minOpacity']);
         this.completeRender();
+        layer.fire('heatstats', { stats: this._heatStats });
     }
 
     drawOnInteracting() {
@@ -224,67 +239,19 @@ HeatLayer.registerRenderer('canvas', class extends maptalks.renderer.CanvasRende
     }
 
     _heatData(heats, displayExtent) {
-        const map = this.getMap(),
-            layer = this.layer;
-        const projection = map.getProjection();
-        const data = [],
-            r = this._heater._r,
-            max = layer.options['max'] === undefined ? 1 : layer.options['max'],
-            cellSize = r / 2,
-            grid = [],
-            panePos = map.offsetPlatform(),
-            offsetX = Math.abs(panePos.x) % cellSize,
-            offsetY = Math.abs(panePos.y) % cellSize;
-        let heat, p, cell, x, y, k;
-        // displayExtent = displayExtent.expand(r).convertTo(c => new maptalks.Point(map._containerPointToPrj(c)));
-        const { xmin, ymin, xmax, ymax } = displayExtent.expand(r);
-        this._heatRadius = r;
-        const coord = new maptalks.Coordinate(0, 0);
-        for (let i = 0, l = heats.length; i < l; i++) {
-            heat = heats[i];
-            if (!this._heatViews[i]) {
-                this._heatViews[i] = projection.project(coord.set(heat[0], heat[1]));
-            }
-            p = this._heatViews[i];
-            //fix https://github.com/maptalks/maptalks.heatmap/issues/54
-            // if (displayExtent.contains(p)) {
-            p = map._prjToContainerPoint(p);
-            if (p.x < xmin || p.x > xmax || p.y < ymin || p.y > ymax) {
-                continue;
-            }
-            x = Math.floor((p.x - offsetX) / cellSize) + 2;
-            y = Math.floor((p.y - offsetY) / cellSize) + 2;
+        const result = buildHeatData(this.getMap(), this.layer, heats, displayExtent, this._heater._r);
+        return result.data;
+    }
 
-            k = (heat[2] !== undefined ? +heat[2] : 0.1) * layer.options['heatValueScale'];
-
-            grid[y] = grid[y] || [];
-            cell = grid[y][x];
-
-            if (!cell) {
-                grid[y][x] = [p.x, p.y, k];
-
-            } else {
-                cell[0] = (cell[0] * cell[2] + (p.x) * k) / (cell[2] + k); // x
-                cell[1] = (cell[1] * cell[2] + (p.y) * k) / (cell[2] + k); // y
-                cell[2] += k; // cumulated intensity value
-            }
-            // }
+    getHeatStats(options) {
+        if (options) {
+            const map = this.getMap();
+            const displayExtent = map.getContainerExtent();
+            const heatRadius = getHeatRadius(map, this.layer),
+                r = this._heater ? this._heater._r : heatRadius + getHeatBlur(map, this.layer, heatRadius);
+            return buildHeatData(map, this.layer, this.layer.getData(), displayExtent, r, options).stats;
         }
-        for (let i = 0, l = grid.length; i < l; i++) {
-            if (grid[i] && grid[i].length) {
-                for (let j = 0, ll = grid[i].length; j < ll; j++) {
-                    cell = grid[i][j];
-                    if (cell) {
-                        data.push([
-                            Math.round(cell[0]),
-                            Math.round(cell[1]),
-                            Math.min(cell[2], max)
-                        ]);
-                    }
-                }
-            }
-        }
-        return data;
+        return this._heatStats || [];
     }
 
     onZoomEnd() {
@@ -331,6 +298,12 @@ if (typeof CanvasCompatible !== 'undefined') {
             if (!this._renderer) {
                 return;
             }
+            const map = this.getMap();
+            const heatRadius = getHeatRadius(map, this.layer);
+            if (this._heatRadius !== heatRadius) {
+                this._heatRadius = heatRadius;
+                this._reset();
+            }
             const heats = this.layer.getData();
             if (heats.length !== this.pointCount) {
                 for (let i = this.pointCount; i < heats.length; i++) {
@@ -341,7 +314,6 @@ if (typeof CanvasCompatible !== 'undefined') {
             const fbo = parentContext && parentContext.renderTarget && parentContext.renderTarget.fbo;
             this._clearFBO();
             this._geometry.setDrawCount(this.pointCount * 6);
-            const map = this.getMap();
             const glRes = map.getGLRes();
             const uniforms = {
                 zoomScale: map.getResolution() / glRes,
@@ -349,6 +321,8 @@ if (typeof CanvasCompatible !== 'undefined') {
             };
             this._renderer.render(this._pointShader, uniforms, this._scene, this._fbo);
             this._renderer.render(this._gradientShader, null, this._gradientScene, fbo);
+            this._heatStats = buildHeatData(map, this.layer, heats, map.getContainerExtent(), heatRadius).stats;
+            this.layer.fire('heatstats', { stats: this._heatStats });
         }
 
         updateData(point) {
@@ -365,6 +339,21 @@ if (typeof CanvasCompatible !== 'undefined') {
 
         clearHeatCache() {
 
+        }
+
+        getHeatStats(options) {
+            const map = this.getMap();
+            if (options || !this._heatStats) {
+                return buildHeatData(
+                    map,
+                    this.layer,
+                    this.layer.getData(),
+                    map.getContainerExtent(),
+                    getHeatRadius(map, this.layer),
+                    options
+                ).stats;
+            }
+            return this._heatStats;
         }
 
         resetData() {
@@ -558,7 +547,7 @@ if (typeof CanvasCompatible !== 'undefined') {
         }
 
         addPoint(x, y, intensity) {
-            const size = this.layer.options['radius'] || 25;
+            const size = this._heatRadius || getHeatRadius(this.getMap(), this.layer);
             if (intensity == null) {
                 intensity = 0.2;
             }
@@ -655,6 +644,214 @@ if (typeof CanvasCompatible !== 'undefined') {
     HeatLayer.registerRenderer('gl', HeatLayerGLRenderer);
     HeatLayer.registerRenderer('gpu', HeatLayerGLRenderer);
     options.renderer = 'gl';
+}
+
+function getHeatRadius(map, layer) {
+    const radiusInMeters = +layer.options['radiusInMeters'];
+    if (radiusInMeters > 0) {
+        return metersToContainerPixels(map, radiusInMeters);
+    }
+    return layer.options['radius'] || 25;
+}
+
+function getHeatBlur(map, layer, heatRadius) {
+    const blur = layer.options['blur'];
+    if (!(+layer.options['radiusInMeters'] > 0)) {
+        return blur;
+    }
+    const baseRadius = layer.options['radius'] || 25;
+    return blur === undefined ? blur : heatRadius * blur / baseRadius;
+}
+
+function metersToContainerPixels(map, meters) {
+    const center = map.getCenter(),
+        p1 = map.coordinateToContainerPoint(center),
+        p2 = map.coordinateToContainerPoint(locateByMeters(map, center, meters));
+    return Math.max(1, p1.distanceTo ? p1.distanceTo(p2) : distance(p1, p2));
+}
+
+function locateByMeters(map, coordinate, meters) {
+    if (map.locate) {
+        return map.locate(coordinate, meters, 0);
+    }
+    const lat = coordinate.y,
+        lng = coordinate.x,
+        lngDelta = meters / (111320 * Math.max(Math.cos(lat * Math.PI / 180), 0.00001));
+    return new maptalks.Coordinate(lng + lngDelta, lat);
+}
+
+function distance(p1, p2) {
+    const dx = p1.x - p2.x,
+        dy = p1.y - p2.y;
+    return Math.sqrt(dx * dx + dy * dy);
+}
+
+function buildHeatData(map, layer, heats, displayExtent, radius, statsOptions) {
+    const projection = map.getProjection();
+    const data = [],
+        cells = [],
+        r = radius || layer.options['radius'] || 25,
+        max = layer.options['max'] === undefined ? 1 : layer.options['max'],
+        cellSize = r / 2,
+        grid = [],
+        panePos = map.offsetPlatform(),
+        offsetX = Math.abs(panePos.x) % cellSize,
+        offsetY = Math.abs(panePos.y) % cellSize;
+    let heat, p, cell, x, y, k;
+    const { xmin, ymin, xmax, ymax } = displayExtent.expand(r);
+    const coord = new maptalks.Coordinate(0, 0);
+
+    for (let i = 0, l = heats.length; i < l; i++) {
+        heat = heats[i];
+        p = projection.project(coord.set(heat[0], heat[1]));
+        p = map._prjToContainerPoint(p);
+        if (p.x < xmin || p.x > xmax || p.y < ymin || p.y > ymax) {
+            continue;
+        }
+        x = Math.floor((p.x - offsetX) / cellSize) + 2;
+        y = Math.floor((p.y - offsetY) / cellSize) + 2;
+
+        k = (heat[2] !== undefined ? +heat[2] : 0.1) * layer.options['heatValueScale'];
+        if (!isFinite(k) || k <= 0) {
+            continue;
+        }
+
+        grid[y] = grid[y] || [];
+        cell = grid[y][x];
+
+        if (!cell) {
+            grid[y][x] = [p.x, p.y, k, 1, x, y];
+        } else {
+            cell[0] = (cell[0] * cell[2] + (p.x) * k) / (cell[2] + k);
+            cell[1] = (cell[1] * cell[2] + (p.y) * k) / (cell[2] + k);
+            cell[2] += k;
+            cell[3] += 1;
+        }
+    }
+    for (let i = 0, l = grid.length; i < l; i++) {
+        if (grid[i] && grid[i].length) {
+            for (let j = 0, ll = grid[i].length; j < ll; j++) {
+                cell = grid[i][j];
+                if (cell) {
+                    const viewPoint = [
+                        Math.round(cell[0]),
+                        Math.round(cell[1]),
+                        Math.min(cell[2], max)
+                    ];
+                    data.push(viewPoint);
+                    cells.push({
+                        x: viewPoint[0],
+                        y: viewPoint[1],
+                        value: cell[2],
+                        intensity: max ? Math.min(cell[2], max) / max : 0,
+                        count: cell[3],
+                        col: cell[4],
+                        row: cell[5]
+                    });
+                }
+            }
+        }
+    }
+
+    return {
+        data,
+        stats: buildHeatStats(map, cells, max, statsOptions)
+    };
+}
+
+function buildHeatStats(map, cells, max, options) {
+    options = options || {};
+    if (!cells.length) {
+        return [];
+    }
+    let maxValue = 0;
+    for (let i = 0; i < cells.length; i++) {
+        maxValue = Math.max(maxValue, cells[i].value);
+    }
+    const minValue = options['minValue'] === undefined ?
+        maxValue * (options['threshold'] === undefined ? 0.6 : options['threshold']) :
+        options['minValue'];
+    const limit = options['limit'] === undefined ? 10 : options['limit'];
+    const cellMap = {};
+    const visited = {};
+    const stats = [];
+
+    for (let i = 0; i < cells.length; i++) {
+        if (cells[i].value >= minValue) {
+            cellMap[cellKey(cells[i].row, cells[i].col)] = cells[i];
+        }
+    }
+
+    for (const key in cellMap) {
+        if (visited[key]) {
+            continue;
+        }
+        const stack = [cellMap[key]];
+        let value = 0, count = 0, wx = 0, wy = 0, peak = 0, peakCell = null;
+        visited[key] = true;
+        while (stack.length) {
+            const cell = stack.pop();
+            value += cell.value;
+            count += cell.count;
+            wx += cell.x * cell.value;
+            wy += cell.y * cell.value;
+            if (cell.value > peak) {
+                peak = cell.value;
+                peakCell = cell;
+            }
+            for (let row = cell.row - 1; row <= cell.row + 1; row++) {
+                for (let col = cell.col - 1; col <= cell.col + 1; col++) {
+                    const nextKey = cellKey(row, col);
+                    if (cellMap[nextKey] && !visited[nextKey]) {
+                        visited[nextKey] = true;
+                        stack.push(cellMap[nextKey]);
+                    }
+                }
+            }
+        }
+        if (value > 0) {
+            const x = wx / value,
+                y = wy / value,
+                coordinate = containerPointToCoordinate(map, x, y),
+                peakCoordinate = containerPointToCoordinate(map, peakCell.x, peakCell.y),
+                peakIntensity = max ? Math.min(peak, max) / max : 0;
+            stats.push({
+                coordinate,
+                point: { x, y },
+                value,
+                intensity: max ? Math.min(value, max) / max : 0,
+                peakValue: peak,
+                peakIntensity,
+                peakCoordinate,
+                peakPoint: { x: peakCell.x, y: peakCell.y },
+                count,
+                level: heatLevel(peakIntensity)
+            });
+        }
+    }
+
+    stats.sort((a, b) => b.value - a.value);
+    return limit > 0 ? stats.slice(0, limit) : stats;
+}
+
+function cellKey(row, col) {
+    return row + ':' + col;
+}
+
+function heatLevel(intensity) {
+    if (intensity >= 0.8) {
+        return 'high';
+    }
+    if (intensity >= 0.5) {
+        return 'medium';
+    }
+    return 'low';
+}
+
+function containerPointToCoordinate(map, x, y) {
+    const prj = map._containerPointToPrj(new maptalks.Point(x, y));
+    const coordinate = map.getProjection().unproject(prj);
+    return [coordinate.x, coordinate.y];
 }
 
 function gradient(grad) {
